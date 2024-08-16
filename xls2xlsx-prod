@@ -1,0 +1,326 @@
+import os
+import json
+import re
+import boto3
+import pandas as pd
+import numpy as np
+import urllib.parse
+import requests
+from requests.auth import HTTPBasicAuth
+from xlrd import open_workbook
+
+s3_client = boto3.client('s3')
+
+# Define column variations for standardization
+COLUMN_VARIATIONS = {
+    'Cheque/Reference No': [
+        'Chq./Ref.No.', 'Chq./Ref.No', 'Chq No', 'Cheque no / Ref No', 'Instr. No.', 'CHQ.NO.',
+        'CHQ/REF.NO.', 'CHQ/REF.NO', 'CHQ NO', 'CHEQUE NO / REF NO', 'INSTR. NO.', 'CHEQUE/REF.NO.', 'CHEQUE/REF.NO',
+        'CHEQUENO/REFNO', 'CHEQUENO.REF.NO','CHQNO', 'Ref No./Cheque No.', 'Chq./Ref. No.'
+    ],
+    'Transaction ID': [
+        'Tran Id', 'Transaction ID', 'TRAN ID', 'TRANSACTION ID', 'TRANS ID', 'TRANS. ID', 'TRANSACTION IDENTIFIER'
+    ],
+    'Value Date': [
+        'Value Date', 'Value Dt', 'VALUE DATE', 'VALUE DT', 'VAL DATE', 'VAL DT', 'V.DATE', 'VALUE DATE/VAL DT'
+    ],
+    'Transaction Date': [
+        'Transaction Date', 'Tran Date', 'Date', 'TRANSACTION DATE', 'TRAN DATE', 'DATE', 'TXN DATE', 'TXN DT',
+        'TRANSACTION DT', 'TXDATE', 'Txn Date'
+    ],
+    'Transaction Posted Date': [
+        'Transaction Posted Date', 'TRANSACTION POSTED DATE', 'POSTED DATE', 'POSTING DATE', 'TRANSACTION POSTING DATE'
+    ],
+    'Transaction Remarks': [
+        'Transaction Remarks', 'Particulars', 'Narration', 'Description', 'PARTICULARS', 'TRANSACTION REMARKS', 
+        'NARRATION', 'DESCRIPTION', 'REMARKS', 'TRAN REMARKS', 'TXN REMARKS', 'PARTICULAR', 'DESCR', 'DESC', 'Transaction Particulars' 'Description/Narration', 'Narration / Particular'
+    ],
+    'Withdrawal Amount': [
+        'Withdrawal Amt.', 'Withdrawal (Dr)', 'Debit', 'Withdrawal Amount', 'Withdrawal', 'Debits', 'WITHDRAWALS', 
+        'WITHDRAWAL AMT.', 'WITHDRAWAL (DR)', 'DEBIT', 'WITHDRAWAL AMOUNT', 'WITHDRAWAL', 'DEBITS', 'WITHDRAWN',
+        'DR', 'WD', 'WITHDRAWAL', 'DR. AMOUNT', 'DEBIT AMOUNT', 'Withdrawal Amt (INR)', 'Debit(Dr.)'
+    ],
+    'Deposit Amount': [
+        'Deposit Amt.', 'Deposit (Cr)', 'Credit', 'Deposit Amount', 'Deposit', 'Credits', 'DEPOSITS', 
+        'DEPOSIT AMT.', 'DEPOSIT (CR)', 'CREDIT', 'DEPOSIT AMOUNT', 'DEPOSIT', 'CREDITS', 'DEPOSITED', 'CR', 
+        'CD', 'DEPOSIT', 'CR. AMOUNT', 'CREDIT AMOUNT', 'Deposit Amt (INR)', 'Credit(Cr.)'
+    ],
+    'Closing Balance': [
+        'Closing Balance', 'Balance', 'BALANCE', 'CLOSING BALANCE', 'CLOSING BAL.', 'CL BALANCE', 'CL BAL', 
+        'FINAL BALANCE', 'END BALANCE', 'ENDING BALANCE','Balance(INR)','Balance (INR)', 'Available Balance'
+    ],
+    'Branch Initials': [
+        'Init. Br', 'INIT. BR', 'BRANCH INIT.', 'BRANCH INIT', 'INITIALS', 'BR. INITIALS', 'BR. INIT.', 'Branch Name', 'Bank Ref no'
+    ]
+}
+
+def extract_ids(filename):
+    file_id_match = re.search(r'_F#(\d+)F#_', filename)
+    business_id_match = re.search(r'_B#(\d+)B#', filename)
+    
+    file_id = file_id_match.group(1) if file_id_match else None
+    business_id = business_id_match.group(1) if business_id_match else None
+    
+    return file_id, business_id
+    
+def load_excel(file_path):
+    # Determine the file extension
+    file_ext = os.path.splitext(file_path)[1].lower()
+    
+    # Handle .xls files by converting them to .xlsx
+    if file_ext == '.xls':
+        xls_book = open_workbook(file_path)
+        xlsx_path = file_path.replace('.xls', '.xlsx')
+        
+        with pd.ExcelWriter(xlsx_path, engine='openpyxl') as writer:
+            for sheet_name in xls_book.sheet_names():
+                df = pd.read_excel(file_path, sheet_name=sheet_name)
+                df.to_excel(writer, sheet_name=sheet_name, index=False)
+        
+        return pd.read_excel(xlsx_path, header=None)
+    
+    # Handle .xlsx files directly
+    return pd.read_excel(file_path, header=None)
+
+# Function to drop rows with too many empty values
+def drop_bad_rows(df, max_empty_values=3):
+    df['empty_count'] = df.isna().sum(axis=1)
+    df = df[df['empty_count'] <= max_empty_values].drop(columns=['empty_count'])
+    return df.reset_index(drop=True)
+
+# Function to set the topmost valid row as header
+def set_header(df):
+    df.columns = df.iloc[0].str.strip()  # Strip whitespace from header names
+    df = df[1:].reset_index(drop=True)
+    return df
+
+# Drop empty columns
+def drop_empty_columns(df):
+    df = df.dropna(axis=1, how='all')
+    return df
+
+# Replace hyphens or 'nul' with empty cells
+def replace_hyphens_and_nul(df):
+    df.replace(['-', 'nul'], '', inplace=True)
+    return df
+
+# Standardize column headers
+def standardize_column_names(df):
+    column_mapping = {}
+    for standard_name, variations in COLUMN_VARIATIONS.items():
+        for variation in variations:
+            if variation in df.columns:
+                column_mapping[variation] = standard_name
+    df.rename(columns=column_mapping, inplace=True)
+    return df
+
+# Clean date string function (only for string types)
+def clean_date_string(date_str):
+    if isinstance(date_str, str):
+        # Remove unwanted spaces and special characters except those used in dates
+        cleaned_date = re.sub(r'\s+|[^0-9a-zA-Z/-]', '', date_str)
+        # Remove timestamps if present
+        cleaned_date = re.sub(r'\d{2}:\d{2}:\d{2}.*$', '', cleaned_date)
+        # Replace month names with numeric equivalents
+        cleaned_date = cleaned_date.replace('January', '01').replace('February', '02').replace('March', '03') \
+                                   .replace('April', '04').replace('May', '05').replace('June', '06') \
+                                   .replace('July', '07').replace('August', '08').replace('September', '09') \
+                                   .replace('October', '10').replace('November', '11').replace('December', '12') \
+                                   .replace('Jan', '01').replace('Feb', '02').replace('Mar', '03') \
+                                   .replace('Apr', '04').replace('Jun', '06').replace('Jul', '07') \
+                                   .replace('Aug', '08').replace('Sep', '09').replace('Oct', '10') \
+                                   .replace('Nov', '11').replace('Dec', '12') \
+                                   .replace('an', '01').replace('eb', '02').replace('ar', '03') \
+                                   .replace('pr', '04').replace('ay', '05').replace('un', '06') \
+                                   .replace('ul', '07').replace('ug', '08').replace('ep', '09') \
+                                   .replace('ct', '10').replace('ov', '11').replace('ec', '12')
+        return cleaned_date
+    return date_str
+
+# Attempt to convert using multiple formats
+def try_parse_date(date_str):
+    # If it's already a datetime object, return formatted string
+    if isinstance(date_str, pd.Timestamp):
+        return date_str.strftime('%d/%m/%Y')
+    
+    date_formats = [
+        '%d-%m-%Y', '%d/%m/%Y', '%d %m %Y', '%Y-%m-%d',
+        '%d-%b-%Y', '%b-%d-%Y', '%d-%B-%Y', '%B-%d-%Y',
+        '%d/%m/%y', '%d-%b-%y', '%d-%m-%y', '%b-%d-%y',
+        '%Y%m%d', '%Y/%m/%d', '%m-%d-%Y', '%d-%m-%Y',
+        '%m/%d/%Y', '%d %b %Y', '%d%b%Y',  # Added '%d%b%Y' for formats like 03Aug2023
+        '%Y-%W-%w'
+    ]
+    
+    for fmt in date_formats:
+        try:
+            # Parse the date and format it
+            parsed_date = pd.to_datetime(date_str, format=fmt, errors='raise').strftime('%d/%m/%Y')
+            return parsed_date
+        except ValueError:
+            continue
+
+    # Try to parse Unix timestamps if applicable
+    try:
+        return pd.to_datetime(int(date_str), unit='s').strftime('%d/%m/%Y')
+    except (ValueError, TypeError):
+        return None
+
+# Format date column in a DataFrame
+def format_date_column(df, column_name):
+    if column_name in df.columns:
+        # Apply cleaning, remove time part, and format the date column
+        df[column_name] = df[column_name].apply(
+            lambda x: try_parse_date(clean_date_string(x)) if isinstance(x, str) else x.strftime('%d/%m/%Y')
+        )
+    return df
+
+# Format multiple date columns and handle conversion issues
+def format_date_columns(df):
+    date_columns = ['Value Date', 'Transaction Date', 'Transaction Posted Date']
+    
+    for column in date_columns:
+        if column in df.columns:
+            # Clean and format the date column
+            df = format_date_column(df, column)
+            
+            # Print out rows with conversion issues for debugging
+            conversion_issues = df[df[column].apply(lambda x: pd.to_datetime(x, errors='coerce')).isna() & df[column].notna()]
+            if not conversion_issues.empty:
+                print(f"Conversion issues in column {column}:")
+                print(conversion_issues[[column]])
+    
+    return df
+
+def remove_commas_from_amounts(df):
+    amount_columns = ['Withdrawal Amount', 'Deposit Amount', 'Closing Balance']
+    
+    for column in amount_columns:
+        if column in df.columns:
+            # Convert the column to string to ensure proper replacement
+            df[column] = df[column].astype(str).str.replace(',', '', regex=False)
+            
+            # Now convert it back to a numeric format (float)
+            df[column] = pd.to_numeric(df[column], errors='coerce')
+    
+    return df
+
+# Split Amount(INR) and DR|CR columns into DR and CR columns
+def split_amount_columns(df):
+    if 'Amount(INR)' in df.columns and 'DR|CR' in df.columns:
+        amount_index = df.columns.get_loc('Amount(INR)')
+        drcr_index = df.columns.get_loc('DR|CR')
+        df['DR'] = df.apply(lambda row: row['Amount(INR)'] if row['DR|CR'] == 'DR' else None, axis=1)
+        df['CR'] = df.apply(lambda row: row['Amount(INR)'] if row['DR|CR'] == 'CR' else None, axis=1)
+        df.drop(columns=['Amount(INR)', 'DR|CR'], inplace=True)
+        df.insert(amount_index, 'DR', df.pop('DR'))
+        df.insert(drcr_index, 'CR', df.pop('CR'))
+    return df
+    
+def remove_unnamed_columns(df):
+    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+    return df
+    
+# Main function to clean the Excel file
+def clean_excel(file_path, output_path):
+    df = load_excel(file_path)
+    # Check if the number of rows exceeds 1500
+    if len(df) > 1500:
+        raise ValueError("The number of records exceeds the allowable limit of 1500.")
+    df = drop_bad_rows(df)
+    df = set_header(df)
+    df = drop_empty_columns(df)
+    df = remove_unnamed_columns(df) 
+    df = replace_hyphens_and_nul(df)
+    df = split_amount_columns(df)  # Ensure split happens before standardizing column names
+    df = standardize_column_names(df)
+    df = remove_commas_from_amounts(df)
+    df = format_date_columns(df)
+    df.to_excel(output_path, index=False)
+    return output_path
+
+def update_status(file_info, status, status_update_url, error_message=None):
+    auth = HTTPBasicAuth('apiuser', 'Admin@123')
+    headers = {'Content-Type': 'application/json'}
+    
+    payload = {
+        "files_status": [
+            {**file_info, "status": str(status)} if status == 1 else {**file_info, "status": str(status), "error": error_message}
+        ]
+    }
+    
+    response = requests.post(status_update_url, auth=auth, headers=headers, data=json.dumps(payload))
+    if response.status_code == 401:
+        print(f"Unauthorized: {response.status_code}")
+    elif response.status_code == 403:
+        print(f"Forbidden: {response.status_code}")
+    else:
+        print(f"Status update response: {response.status_code}")
+
+def process_file(file_info, bucket_name, xls_prefix, xls_output_prefix, status_update_url):
+    try:
+        xls_file_name = file_info['file_name']
+        xls_path = f"/tmp/{xls_file_name}"
+        
+        print(f"Starting processing for {xls_file_name}...")
+        s3_client.download_file(bucket_name, f"{xls_prefix}{xls_file_name}", xls_path)
+        print(f"Downloaded {xls_file_name} to {xls_path}")
+        
+        # Ensuring correct replacement and avoiding multiple replacements
+        if xls_path.endswith('.xls'):
+            cleaned_xls_path = xls_path.replace('.xls', '.xlsx')
+        else:
+            cleaned_xls_path = xls_path  # already has the correct extension
+        
+        clean_excel(xls_path, cleaned_xls_path)
+        print(f"Cleaned file saved as {cleaned_xls_path}")
+
+        xls_key = f"{xls_output_prefix}{os.path.basename(cleaned_xls_path)}"
+        print(f"Uploading {cleaned_xls_path} to S3 bucket {bucket_name} with key {xls_key}...")
+        s3_client.upload_file(cleaned_xls_path, bucket_name, xls_key)
+        
+        print(f"Uploaded {cleaned_xls_path} to {xls_key}")
+        status = 1
+        error_message = None
+        
+        file_info['file_name'] = os.path.basename(cleaned_xls_path)
+    except Exception as e:
+        error_message = str(e)
+        print(f"Error processing {xls_file_name}: {error_message}")
+        status = 0
+
+    update_status(file_info, status, status_update_url, error_message if status == 0 else None)
+    return status
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event, indent=2))
+
+    # Extract bucket name and key from the S3 event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+    xls_file_name = os.path.basename(key)
+
+    # Extract FileId and BusinessId
+    file_id, business_id = extract_ids(xls_file_name)
+
+    # Prepare file information for processing
+    file_info = {
+        'file_name': xls_file_name,
+        'file_id': file_id,
+        'business_id': business_id
+    }
+
+    # Fetch environment variables
+    status_update_url = os.getenv('STATUS_UPDATE_URL')
+    
+    # Define constants
+    xls_prefix = 'xls-2/'
+    xls_output_prefix = 'xlsx/'
+
+    # Process the file
+    process_file(file_info, bucket, xls_prefix, xls_output_prefix, status_update_url)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Processing completed.')
+    }
