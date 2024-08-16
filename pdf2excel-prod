@@ -1,0 +1,657 @@
+import pandas as pd
+import os
+import json
+import boto3
+import io
+import sys
+import time
+import base64
+import re
+from pdf2image import convert_from_path
+from io import StringIO
+import csv
+from concurrent.futures import ThreadPoolExecutor
+import requests
+from requests.auth import HTTPBasicAuth
+import urllib.parse
+import shutil
+
+### Code By Vijay ##
+COLUMN_VARIATIONS = {
+    'Cheque/Reference No': [
+        'Cheque/Reference No', 'Chq./Ref.No.', 'Chq./Ref.No', 'Chq No', 'Cheque no / Ref No', 'Instr. No.', 'CHQ.NO.',
+        'CHQ/REF.NO.', 'CHQ/REF.NO', 'CHQ NO', 'CHEQUE NO / REF NO', 'INSTR. NO.', 'CHEQUE/REF.NO.', 'CHEQUE/REF.NO',
+        'CHEQUENO/REFNO', 'CHEQUENO.REF.NO', 'CHQ/REFNO', 'CHEQUENO/REF. NO.', 'Chq./Ref. No.', 'REF/CHQ.NO',
+        'CHQNO', 'Ref No./Cheque No.'
+    ],
+    'Transaction ID': [
+        'Transaction ID', 'Tran Id', 'TRAN ID', 'TRANSACTION ID', 'TRANS ID', 'TRANS. ID', 'TRANSACTION IDENTIFIER',
+        'TRANS. IDENTIFIER', 'TXN ID', 'TXN IDENTIFIER'
+    ],
+    'Value Date': [
+        'Value Date', 'Value Dt', 'VALUE DATE', 'VALUE DT', 'VAL DATE', 'VAL DT', 'V.DATE', 'VALUE DATE/VAL DT',
+        'VALUE DATE (VAL DT)', 'VAL. DATE', 'VAL. DT'
+    ],
+    'Transaction Date': [
+        'Transaction Date', 'Tran Date', 'Date', 'TRANSACTION DATE', 'TRAN DATE', 'DATE', 'TXN DATE', 'TXN DT',
+        'TRANSACTION DT', 'TXDATE', 'TXN', 'TX DATE', 'TRX DATE', 'TRX DT', 'TRANS DATE', 'Txn Date'
+    ],
+    'Transaction Posted Date': [
+        'Transaction Posted Date', 'TRANSACTION POSTED DATE', 'POSTED DATE', 'POSTING DATE', 'TRANSACTION POSTING DATE',
+        'TXN POSTED DATE', 'TXN POSTING DATE'
+    ],
+    'Transaction Remarks': [
+        'Transaction Remarks', 'Particulars', 'Narration', 'Description', 'PARTICULARS', 'TRANSACTION REMARKS', 
+        'NARRATION', 'DESCRIPTION', 'REMARKS', 'TRAN REMARKS', 'TXN REMARKS', 'PARTICULAR', 'DESCR', 'DESC',
+        'Details', 'DETAILS', 'TXN DESCRIPTION', 'TRAN DESCRIPTION', 'TXN DETAILS', 'TRX DETAILS', 'TRX REMARKS',
+        'Description/Narration', 'Transaction Particulars'
+    ],
+    'Withdrawal Amount': [
+        'Withdrawal Amount', 'Withdrawal Amt.', 'Withdrawal (Dr)', 'Debit', 'Withdrawal', 'Debits', 'WITHDRAWALS', 
+        'WITHDRAWAL AMT.', 'WITHDRAWAL (DR)', 'DEBIT', 'WITHDRAWAL AMOUNT', 'WITHDRAWAL', 'DEBITS', 'WITHDRAWN',
+        'DR', 'WD', 'WITHDRAWAL', 'DR. AMOUNT', 'DEBIT AMOUNT', 'WITHDRAW', 'WITHDRAWAL SUM', 'DR SUM', 'Debit(Dr.)',
+        'WITHDRAWAL(DR)', 'Withdrawal Amt (INR)', 'Withdrawals', 'withdrawals'
+    ],
+    'Deposit Amount': [
+        'Deposit Amount', 'Deposit Amt.', 'Deposit (Cr)', 'Credit', 'Deposit', 'Credits', 'DEPOSITS', 
+        'DEPOSIT AMT.', 'DEPOSIT (CR)', 'CREDIT', 'DEPOSIT AMOUNT', 'DEPOSIT', 'CREDITS', 'DEPOSITED', 'CR', 
+        'CD', 'DEPOSIT', 'CR. AMOUNT', 'CREDIT AMOUNT', 'DEPOSIT SUM', 'CR SUM', 'Credit(Cr.)', 'Deposit Amt (INR)',
+        'DEPOSIT(CR)', 'Deposits', 'deposits'
+    ],
+    'Closing Balance': [
+        'Closing Balance', 'Balance', 'BALANCE', 'CLOSING BALANCE', 'CLOSING BAL.', 'CL BALANCE', 'CL BAL', 
+        'FINAL BALANCE', 'END BALANCE', 'ENDING BALANCE', 'BAL', 'BALANCE AMOUNT', 'CL. BAL.', 'CL. BALANCE',
+        'Balance(INR)', 'Balance (INR)', 'Running Balance'
+    ],
+    'Branch Initials': [
+        'Branch Initials', 'Init. Br', 'INIT. BR', 'BRANCH INIT.', 'BRANCH INIT', 'INITIALS', 'BR. INITIALS',
+        'BR. INIT.', 'BRANCH INITI', 'BR INIT', 'BR INIT.', 'Branch Name'
+    ]
+}
+
+
+def replace_hyphens(df, columns):
+    for column in columns:
+        if column in df.columns:
+            df[column] = df[column].apply(lambda x: re.sub(r'-+', '', str(x)))
+    return df
+
+def process_csv(csv_filename):
+    # Read the CSV data from the file
+    with open(csv_filename, 'r') as file:
+        lines = file.readlines()
+
+    # Filter lines with more than 6 delimiters (adjust as needed)
+    transaction_lines = []
+    excluded_lines = []
+    for line in lines:
+        if line.count('|') >= 5:
+            transaction_lines.append(line)
+        else:
+            excluded_lines.append(line)
+
+
+    # Filter out lines with more than a certain number of empty values
+    max_empty_values = 3  # Adjust this threshold as needed
+    filtered_transaction_lines = []
+    excluded_lines = []
+
+    for line in transaction_lines:
+        # Split the line into values based on '|'
+        values = line.strip().split('|')
+        # Count empty values
+        empty_count = values.count('')
+        # Append line to filtered list if empty count is within threshold
+        if empty_count <= max_empty_values:
+            filtered_transaction_lines.append(line)
+        else:
+            excluded_lines.append(line)
+
+    # Check if any transaction lines remain after filtering
+    if filtered_transaction_lines:
+        # Join the filtered lines into a single string
+        transaction_data = "".join(filtered_transaction_lines)
+
+        # Function to remove random spaces within numbers and fix commas to decimals
+        def clean_numbers(text):
+            # Remove spaces within numbers
+            text = re.sub(r'(\d) (\d)', r'\1\2', text)
+            # Fix commas to decimals at the end for two or three decimal places
+            text = re.sub(r',(\d{2,3})(\s|$)', r'.\1\2', text)
+            # Remove spaces before decimal points
+            text = re.sub(r'\s+(\.)', r'\1', text)
+            # Fix cases with multiple decimals by keeping only the rightmost one
+            text = re.sub(r'(\d+)\.(\d+)\.(\d{2})', r'\1\2.\3', text)
+            return text
+
+        # Clean the transaction data
+        cleaned_data = clean_numbers(transaction_data)
+
+        # Convert the cleaned data to a DataFrame
+        transaction_df = pd.read_csv(StringIO(cleaned_data), delimiter='|', header=None)
+
+
+        # Add a check for 'Cr' or 'Dr' and remove it from numerical values
+        def remove_cr_dr(value):
+            if isinstance(value, str):
+                return value.replace(' (Cr)', '').replace(' (Dr)', '').replace(' Cr', '').replace(' Dr', '')
+            return value
+
+        # Apply the function to the relevant columns
+        transaction_df = transaction_df.applymap(remove_cr_dr)
+
+        transaction_df_cleaned = transaction_df.dropna(axis=1, how='all')
+
+        # Sort the DataFrame by the first column
+        transaction_df_sorted = transaction_df.sort_values(by=0).reset_index(drop=True)
+        transaction_df_cleaned = transaction_df_sorted.drop(columns=[0])
+        
+        def find_valid_row(df):
+            for index, row in df.iterrows():
+                # Check if there are any missing values in the row
+                if not row.isnull().any():
+                    # If the row has no missing values, return this portion of the DataFrame
+                    return df.iloc[index:].reset_index(drop=True)
+            return pd.DataFrame()  # Return empty DataFrame if no valid row is found
+
+        # Apply the function to find the first valid row and drop rows above it
+        transaction_df_cleaned = find_valid_row(transaction_df_cleaned)
+
+        # Replace remaining missing values with zero
+        transaction_df_cleaned = transaction_df_cleaned.fillna(0)
+
+        output_csv_path = os.path.join(
+            os.path.dirname(csv_filename),
+            os.path.splitext(os.path.basename(csv_filename))[0] + "_cleaned.csv"
+        )
+        transaction_df_cleaned.to_csv(output_csv_path, sep='|', index=False, header=False)
+
+        return output_csv_path
+
+    else:
+        print("No transaction lines found after filtering.")
+        return None
+
+def clean_closing_balance(df):
+    if 'Closing Balance' in df.columns:
+        # Remove any trailing or leading non-numeric characters
+        df['Closing Balance'] = df['Closing Balance'].str.replace(r'[^\d.-]', '', regex=True)
+
+        # Convert the cleaned values to numeric
+        df['Closing Balance'] = pd.to_numeric(df['Closing Balance'], errors='coerce')
+        
+        # Keep rows even if 'Closing Balance' is NaN (just converted, not dropped)
+        # Optional: Fill NaN values with an empty string or any placeholder if needed
+        df['Closing Balance'] = df['Closing Balance'].fillna('')
+        
+    return df
+
+def standardize_column_names(df):
+    # Create a dictionary to map existing column names to the standardized names
+    column_mapping = {}
+    for standard_name, variations in COLUMN_VARIATIONS.items():
+        for variation in variations:
+            if variation in df.columns:
+                column_mapping[variation] = standard_name
+
+    # Rename the columns using the mapping
+    df.rename(columns=column_mapping, inplace=True)
+
+    return df
+
+# Clean date string function (only for string types)
+def clean_date_string(date_str):
+    if isinstance(date_str, str):
+        # Remove unwanted spaces and special characters except those used in dates
+        cleaned_date = re.sub(r'\s+|[^0-9a-zA-Z/-]', '', date_str)
+        # Remove timestamps if present
+        cleaned_date = re.sub(r'\d{2}:\d{2}:\d{2}.*$', '', cleaned_date)
+        # Replace month names with numeric equivalents
+        cleaned_date = cleaned_date.replace('January', '01').replace('February', '02').replace('March', '03') \
+                                   .replace('April', '04').replace('May', '05').replace('June', '06') \
+                                   .replace('July', '07').replace('August', '08').replace('September', '09') \
+                                   .replace('October', '10').replace('November', '11').replace('December', '12') \
+                                   .replace('Jan', '01').replace('Feb', '02').replace('Mar', '03') \
+                                   .replace('Apr', '04').replace('Jun', '06').replace('Jul', '07') \
+                                   .replace('Aug', '08').replace('Sep', '09').replace('Oct', '10') \
+                                   .replace('Nov', '11').replace('Dec', '12') \
+                                   .replace('an', '01').replace('eb', '02').replace('ar', '03') \
+                                   .replace('pr', '04').replace('ay', '05').replace('un', '06') \
+                                   .replace('ul', '07').replace('ug', '08').replace('ep', '09') \
+                                   .replace('ct', '10').replace('ov', '11').replace('ec', '12')
+        return cleaned_date
+    return date_str
+
+# Attempt to convert using multiple formats
+def try_parse_date(date_str):
+    # If it's already a datetime object, return formatted string
+    if isinstance(date_str, pd.Timestamp):
+        return date_str.strftime('%d/%m/%Y')
+    
+    date_formats = [
+        '%d-%m-%Y', '%d/%m/%Y', '%d %m %Y', '%Y-%m-%d',
+        '%d-%b-%Y', '%b-%d-%Y', '%d-%B-%Y', '%B-%d-%Y',
+        '%d/%m/%y', '%d-%b-%y', '%d-%m-%y', '%b-%d-%y',
+        '%Y%m%d', '%Y/%m/%d', '%m-%d-%Y', '%d-%m-%Y',
+        '%m/%d/%Y', '%d %b %Y', '%d%b%Y',  # Added '%d%b%Y' for formats like 03Aug2023
+        '%Y-%W-%w'
+    ]
+    
+    for fmt in date_formats:
+        try:
+            # Parse the date and format it
+            parsed_date = pd.to_datetime(date_str, format=fmt, errors='raise').strftime('%d/%m/%Y')
+            return parsed_date
+        except ValueError:
+            continue
+
+    # Try to parse Unix timestamps if applicable
+    try:
+        return pd.to_datetime(int(date_str), unit='s').strftime('%d/%m/%Y')
+    except (ValueError, TypeError):
+        return None
+
+# Format date column in a DataFrame
+def format_date_column(df, column_name):
+    if column_name in df.columns:
+        # Apply cleaning, remove time part, and format the date column
+        df[column_name] = df[column_name].apply(
+            lambda x: try_parse_date(clean_date_string(x)) if isinstance(x, str) else x.strftime('%d/%m/%Y')
+        )
+    return df
+
+# Format multiple date columns and handle conversion issues
+def format_date_columns(df):
+    date_columns = ['Value Date', 'Transaction Date', 'Transaction Posted Date']
+    
+    for column in date_columns:
+        if column in df.columns:
+            # Clean and format the date column
+            df = format_date_column(df, column)
+            
+            # Print out rows with conversion issues for debugging
+            conversion_issues = df[df[column].apply(lambda x: pd.to_datetime(x, errors='coerce')).isna() & df[column].notna()]
+            if not conversion_issues.empty:
+                print(f"Conversion issues in column {column}:")
+                print(conversion_issues[[column]])
+    
+    return df
+
+# def remove_duplicates(df):
+#     # Drop duplicate rows
+#     df.drop_duplicates(inplace=True)
+#     return df
+
+def standardize_headers(csv_filename):
+    # Read the cleaned CSV data from the file
+    df = pd.read_csv(csv_filename, delimiter='|', header=None)
+
+    # Set the first row as the header
+    df.columns = df.iloc[0]
+    df = df[1:]
+
+    # Standardize column names
+    df = standardize_column_names(df)
+
+    # df = df[~df.iloc[:, 0].str.lower().eq('date')]
+    # Replace hyphens in specific columns
+    columns_to_replace = ['Withdrawal Amount', 'Deposit Amount']
+    df = replace_hyphens(df, columns_to_replace)
+
+
+    # Replace 'Transaction Posted Date' values with 'Value Date' values
+    if 'Transaction Posted Date' in df.columns and 'Value Date' in df.columns:
+        df['Transaction Posted Date'] = df['Value Date']
+
+    # Remove commas from numerical values
+    for column in ['Withdrawal Amount', 'Deposit Amount', 'Closing Balance']:
+        if column in df.columns:
+            df[column] = df[column].astype(str).str.replace(',', '')
+
+
+    # Format date columns
+    for column in ['Value Date', 'Transaction Date', 'Transaction Posted Date']:
+        df = format_date_column(df, column)
+
+    # Clean the 'Closing Balance' column and remove invalid rows
+    df = clean_closing_balance(df)
+
+    # Remove duplicate rows
+    # df = remove_duplicates(df)
+    # Remove rows where the first column is empty or contains no numbers
+    df = df[df.iloc[:, 0].notna() & df.iloc[:, 0].str.contains('\d')]
+
+    # Save the DataFrame with standardized headers
+    output_csv_path = os.path.join(
+        os.path.dirname(csv_filename),
+        os.path.splitext(os.path.basename(csv_filename))[0] + "_standardized.csv"
+    )
+    df.to_csv(output_csv_path, sep='|', index=False)
+    os.remove(csv_filename)
+    return output_csv_path
+
+def convert_to_excel(csv_filename):
+    # Get the filename without extension
+    filename = os.path.splitext(os.path.basename(csv_filename))[0]
+
+    # Create the output Excel file path in the current directory
+    excel_file = os.path.join(os.path.dirname(csv_filename), f"{filename}.xlsx")
+
+    # Read the CSV file with the pipe delimiter
+    df = pd.read_csv(csv_filename, delimiter='|')
+
+    # Write the DataFrame to an Excel file in the same directory
+    df.to_excel(excel_file, index=False)
+    os.remove(csv_filename)
+    return excel_file
+
+####End ####
+
+def generate_table_csv(table_result, blocks_map, table_index):
+    rows = get_rows_columns_map(table_result, blocks_map)
+    # print(rows)
+    csv = ''
+    for row_index, cols in rows.items():
+        for col_index, text in cols.items():
+            csv += '{}'.format(text).strip() + "|"
+        csv = csv[:-1]
+        csv += '\n'
+    return csv
+
+def get_rows_columns_map(table_result, blocks_map):
+    rows = {}
+    for relationship in table_result['Relationships']:
+        if relationship['Type'] == 'CHILD':
+            for child_id in relationship['Ids']:
+                cell = blocks_map[child_id]
+                if cell['BlockType'] == 'CELL':
+                    row_index = cell['RowIndex']
+                    col_index = cell['ColumnIndex']
+                    if row_index not in rows:
+                        rows[row_index] = {}
+                    rows[row_index][col_index] = get_text(cell, blocks_map)
+    return rows
+
+def get_text(result, blocks_map):
+    text = ''
+    if 'Relationships' in result:
+        for relationship in result['Relationships']:
+            if relationship['Type'] == 'CHILD':
+                for child_id in relationship['Ids']:
+                    word = blocks_map[child_id]
+                    if word['BlockType'] == 'WORD':
+                        text += word['Text'] + ' '
+                    if word['BlockType'] == 'SELECTION_ELEMENT':
+                        if word['SelectionStatus'] == 'SELECTED':
+                            text += 'X '
+    return text
+
+def add_period(number_str):
+    if len(number_str) >= 3:
+        if number_str[-3:].isdigit() or number_str[-3:].isspace():
+            if number_str[-3] == ' ':
+                number_str = number_str[:-3] + '.' + number_str[-2:]
+    return number_str
+
+def process_number(number_str):
+    number_str = number_str.replace(",", "")
+    number_str = re.sub(r'(?<=\d)\s(?=\d)', '', number_str)
+    number_str = add_period(number_str)
+    return number_str
+
+def get_table_csv_results(file_name, aws_access_key_id, aws_secret_access_key, region_name):
+    with open(file_name, 'rb') as file:
+        img_test = file.read()
+    bytes_test = bytearray(img_test)
+    print('Image loaded:', file_name)
+
+    client = boto3.client('textract',
+                          aws_access_key_id=aws_access_key_id,
+                          aws_secret_access_key=aws_secret_access_key,
+                          region_name=region_name)
+    response = client.analyze_document(Document={'Bytes': bytes_test}, FeatureTypes=['TABLES'])
+
+    blocks = response['Blocks']
+    blocks_map = {}
+    table_blocks = []
+
+    for block in blocks:
+        blocks_map[block['Id']] = block
+        if block['BlockType'] == "TABLE":
+            table_blocks.append(block)
+
+    if len(table_blocks) <= 0:
+        return "<b> NO Table FOUND </b>"
+
+    csv = ''
+    for index, table in enumerate(table_blocks):
+        csv += generate_table_csv(table, blocks_map, index + 1)
+        csv += '\n\n'
+    return csv
+
+
+
+def convert_to_excel(csv_filename):
+    # Get the filename without extension
+    filename = os.path.splitext(os.path.basename(csv_filename))[0]
+
+    # Create the output Excel file path in the current directory
+    excel_file = os.path.join(os.path.dirname(csv_filename), f"{filename}.xlsx")
+
+    # Read the CSV file with the pipe delimiter
+    df = pd.read_csv(csv_filename, delimiter='|')
+
+    # Write the DataFrame to an Excel file in the same directory
+    df.to_excel(excel_file, index=False)
+    os.remove(csv_filename)
+    return excel_file
+
+
+def convert_row_to_excel(csv_path):
+    unique_data = []
+    seen = set()
+
+    with open(csv_path, 'r', newline='') as csvfile:
+        csv_reader = csv.reader(csvfile)
+        sorted_data = sorted(csv_reader, key=lambda x: int(x[0]))
+        for row in sorted_data:
+            key = tuple(row[1:])
+            num_values = sum(1 for value in row[1:] if value.strip())
+            if len(row) > 6 and num_values >= 3:
+                if key not in seen:
+                    seen.add(key)
+                    unique_data.append(row[1:])
+
+    df = pd.DataFrame(unique_data)
+    output_excel_path = os.path.join(
+        os.path.dirname(csv_path),
+        os.path.splitext(os.path.basename(csv_path))[0] + ".xlsx"
+    )
+    df.to_excel(output_excel_path, index=False, header=False)
+    print(f"Excel file saved at: {output_excel_path}")
+
+def convert_to_proper_file(csv_path):
+    with open(csv_path, 'r') as file:
+        lines = file.readlines()
+
+    transaction_lines = [line for line in lines if line.count('|') > 6]
+    max_empty_values = 3
+    filtered_transaction_lines = []
+
+    for line in transaction_lines:
+        values = line.strip().split('|')
+        empty_count = values.count('')
+        if empty_count <= max_empty_values:
+            filtered_transaction_lines.append(line)
+
+    if filtered_transaction_lines:
+        transaction_data = "".join(filtered_transaction_lines)
+        transaction_df = pd.read_csv(io.StringIO(transaction_data), delimiter='|', header=None)
+        transaction_df_cleaned = transaction_df.dropna(axis=1, how='all')
+        transaction_df_sorted = transaction_df.sort_values(by=0).reset_index(drop=True)
+        transaction_df_cleaned.to_csv(csv_path, sep='|', index=False, header=False)
+        print(transaction_df_sorted)
+    else:
+        print("No transaction lines found after filtering.")
+
+def main(pdf_path, aws_access_key_id, aws_secret_access_key, region_name, output_image_path):
+    csv_path = os.path.join(
+        os.path.dirname(pdf_path),
+        os.path.splitext(os.path.basename(pdf_path))[0] + ".csv"
+    )
+    document_name = pdf_path
+    images = convert_from_path(document_name)
+    filtered_rows = []
+    index = 0
+
+    for i in range(len(images)):
+        ts = str(time.time()).replace('.', '')
+        fname = os.path.join(output_image_path, f"{ts}_{i}.jpg")
+        images[i].save(fname, 'JPEG')
+        print(fname)
+        table_csv = get_table_csv_results(fname, aws_access_key_id, aws_secret_access_key, region_name)
+        lines = table_csv.strip().split('\n')
+        for line in lines:
+            index += 1
+            line = f"{index}|" + line
+            filtered_rows.append(line)
+
+    with open(csv_path, "wt") as fout:
+        fout.write('\n'.join(set(filtered_rows)))
+    print('CSV OUTPUT FILE:', csv_path)
+    
+    # Print the contents of the CSV file
+    with open(csv_path, "rt") as fin:
+        print(fin.read())
+
+    convert_to_proper_file(csv_path)
+
+s3_client = boto3.client('s3')
+
+def extract_ids(filename):
+    file_id_match = re.search(r'_F#(\d+)F#_', filename)
+    business_id_match = re.search(r'_B#(\d+)B#', filename)
+    
+    file_id = file_id_match.group(1) if file_id_match else None
+    business_id = business_id_match.group(1) if business_id_match else None
+    
+    return file_id, business_id
+
+def process_file(file_info, aws_access_key_id, aws_secret_access_key, region_name, bucket_name, pdf_prefix, xls_prefix, status_update_url):
+    try:
+        pdf_file_name = file_info['file_name']
+        pdf_path = f"/tmp/{pdf_file_name}"
+        
+        print(f"Starting processing for {pdf_file_name}...")
+        s3_client.download_file(bucket_name, f"{pdf_prefix}{pdf_file_name}", pdf_path)
+        print(f"Downloaded {pdf_file_name} to {pdf_path}")
+        
+        output_image_path = "/tmp/images/"
+        os.makedirs(output_image_path, exist_ok=True)
+        main(pdf_path, aws_access_key_id, aws_secret_access_key, region_name, output_image_path)
+        
+        csv_path = os.path.join(
+            os.path.dirname(pdf_path),
+            os.path.splitext(os.path.basename(pdf_path))[0] + ".csv"
+        )
+        
+        if not os.path.exists(csv_path):
+            error_message = f"CSV file not found for {pdf_file_name}"
+            print(error_message)
+            raise FileNotFoundError(error_message)
+        
+        cleaned_csv = process_csv(csv_path)
+        if cleaned_csv:
+            standardized_csv = standardize_headers(cleaned_csv)
+            excel_file = convert_to_excel(standardized_csv)
+            
+            if not os.path.exists(excel_file):
+                error_message = f"Excel file not found for {pdf_file_name}"
+                print(error_message)
+                raise FileNotFoundError(error_message)
+
+            base_filename = os.path.splitext(os.path.basename(excel_file))[0]
+            base_filename = base_filename.replace('_cleaned_standardized', '')
+            new_excel_file = os.path.join(os.path.dirname(excel_file), f"{base_filename}.xlsx")
+            os.rename(excel_file, new_excel_file)
+            
+            xls_key = f"{xls_prefix}{os.path.basename(new_excel_file)}"
+            print(f"Uploading {new_excel_file} to S3 bucket {bucket_name} with key {xls_key}...")
+            s3_client.upload_file(new_excel_file, bucket_name, xls_key)
+            
+            print(f"Uploaded {new_excel_file} to {xls_key}")
+            status = 1
+            error_message = None
+            
+            file_info['file_name'] = os.path.basename(new_excel_file)
+        else:
+            error_message = f"Failed to process CSV for {pdf_file_name}"
+            print(error_message)
+            status = 0
+
+        # Clean up images folder
+        if os.path.exists(output_image_path):
+            shutil.rmtree(output_image_path)
+            print(f"Deleted images folder: {output_image_path}")
+
+    except Exception as e:
+        error_message = str(e)
+        print(f"Error processing {pdf_file_name}: {error_message}")
+        status = 0
+
+    update_status(file_info, status, status_update_url, error_message if status == 0 else None)
+    return status
+
+def update_status(file_info, status, status_update_url, error_message=None):
+    auth = HTTPBasicAuth('apiuser', 'Admin@123')
+    headers = {'Content-Type': 'application/json'}
+    
+    payload = {
+        "files_status": [
+            {**file_info, "status": str(status)} if status == 1 else {**file_info, "status": str(status), "error": error_message}
+        ]
+    }
+    
+    response = requests.post(status_update_url, auth=auth, headers=headers, data=json.dumps(payload))
+    if response.status_code == 401:
+        print(f"Unauthorized: {response.status_code}")
+    elif response.status_code == 403:
+        print(f"Forbidden: {response.status_code}")
+    else:
+        print(f"Status update response: {response.status_code}")
+
+def lambda_handler(event, context):
+    print("Received event:", json.dumps(event, indent=2))
+
+    # Extract bucket name and key from the S3 event
+    bucket = event['Records'][0]['s3']['bucket']['name']
+    key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+    pdf_file_name = os.path.basename(key)
+
+    # Extract FileId and BusinessId
+    file_id, business_id = extract_ids(pdf_file_name)
+
+    # Prepare file information for processing
+    file_info = {
+        'file_name': pdf_file_name,
+        'file_id': file_id,
+        'business_id': business_id
+    }
+
+    # Fetch environment variables
+    status_update_url = os.getenv('STATUS_UPDATE_URL')
+    aws_access_key_id = os.getenv('aws_access_key_id')
+    aws_secret_access_key = os.getenv('aws_secret_access_key')
+    
+    # Define constants
+    region_name = 'ap-south-1'
+    pdf_prefix = 'pdfs/'
+    xls_prefix = 'xlsx/'
+
+    # Process the file
+    process_file(file_info, aws_access_key_id, aws_secret_access_key, region_name, bucket, pdf_prefix, xls_prefix, status_update_url)
+
+    return {
+        'statusCode': 200,
+        'body': json.dumps('Processing completed.')
+    }
